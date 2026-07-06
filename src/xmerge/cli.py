@@ -129,8 +129,41 @@ def cmd_merge(args: argparse.Namespace) -> None:
             "has_token_map": token_map is not None,
             "use_cached": use_cached,
         }
-        _save_json(os.path.join(save_path, "bridge_config.json"), info)
+        _save_json(os.path.join(save_path, "merge_config.json"), info)
         metrics["bridge_info"] = info
+        metrics["status"] = "saved"
+
+    elif method == "standalone":
+        logger.info("Running standalone cross-architecture merge...")
+
+        tok_b = AutoTokenizer.from_pretrained(cfg.get("tokenizer_b", cfg["model_b"]))
+        if tok_b.pad_token is None:
+            tok_b.pad_token = tok_b.eos_token
+
+        token_map = None
+        if cfg.get("cross_tokenizer", False):
+            logger.info("Building cross-tokenizer map...")
+            token_map = utils.build_token_map(tok, tok_b)
+
+        merged = merge_prod.merge_diff_arch_standalone(
+            ma, mb,
+            calib_texts=calib_texts,
+            token_map=token_map,
+            save_name=merge_name,
+            tok=tok,
+            bridge_steps=train_cfg.get("bridge_steps", 10),
+            distill_steps=train_cfg.get("distill_steps", 30),
+            lr=lr,
+            max_len=max_len,
+            bridge_type=train_cfg.get("bridge_type", "linear"),
+            blend_alpha=train_cfg.get("blend_alpha", 0.5),
+            kl_weight=train_cfg.get("kl_weight", 5.0),
+        )
+
+        enc = tok(calib_texts[:16], truncation=True, padding=True, max_length=64, return_tensors="pt")
+        ids = enc.input_ids.to(DEVICE)
+        mask = enc.attention_mask.to(DEVICE)
+        metrics["final_ppl"] = round(merge_prod.ppl(merged, ids, mask), 1)
         metrics["status"] = "saved"
 
     else:
@@ -138,8 +171,9 @@ def cmd_merge(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # Save metrics
-    metrics_path = os.path.join(save_path, "metrics.json")
-    _save_json(metrics_path, metrics)
+    metrics_path = os.path.join(save_path, "merge_config.json")
+    if not os.path.exists(metrics_path):
+        _save_json(metrics_path, metrics)
     logger.info("Done in %.1fs. Results saved to %s", time.time() - t0, save_path)
 
 
@@ -148,7 +182,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
         logger.error("Bridge dir not found: %s", args.bridge_dir)
         sys.exit(1)
 
-    info = _load_json(os.path.join(args.bridge_dir, "bridge_config.json"))
+    info = _load_json(os.path.join(args.bridge_dir, "merge_config.json"))
     logger.info("Loading bridge from %s", args.bridge_dir)
     logger.info("  Model A: %s", info["model_a"])
     logger.info("  Model B: %s", info["model_b"])
@@ -230,27 +264,13 @@ def cmd_list(args: argparse.Namespace) -> None:
         path = os.path.join(SAVE_DIR, name)
         if not os.path.isdir(path):
             continue
-        info_path = os.path.join(path, "bridge_config.json")
-        merge_info_path = os.path.join(path, "merge_info.json")
-        metrics_path = os.path.join(path, "metrics.json")
+        info_path = os.path.join(path, "merge_config.json")
 
         if os.path.exists(info_path):
             info = _load_json(info_path)
-            ppl_str = str(info.get("ppl_bridge", "?"))
+            ppl_str = str(info.get("final_ppl", info.get("ppl_bridge", "?")))
             models = f"{info.get('model_a','?')} + {info.get('model_b','?')}"
-            mtype = info.get("type", "bridge")
-            print(f"{name:<30} {mtype:<20} {ppl_str:<10} {models}")
-        elif os.path.exists(merge_info_path):
-            info = _load_json(merge_info_path)
-            ppl_str = str(info.get("final_ppl", "?"))
-            models = "(same arch)"
-            mtype = info.get("type", "merge")
-            print(f"{name:<30} {mtype:<20} {ppl_str:<10} {models}")
-        elif os.path.exists(metrics_path):
-            info = _load_json(metrics_path)
-            ppl_str = str(info.get("final_ppl", "?"))
-            models = f"{info.get('model_a','?')} + {info.get('model_b','?')}"
-            mtype = info.get("method", "?")
+            mtype = info.get("type", "?")
             print(f"{name:<30} {mtype:<20} {ppl_str:<10} {models}")
 
 

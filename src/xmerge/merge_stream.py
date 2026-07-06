@@ -337,7 +337,6 @@ def streamed_merge_improved(
     calib_texts: Optional[List[str]] = None,
     save_name: Optional[str] = None,
     device: str = "cuda",
-    use_procrustes: bool = False,
 ) -> Tuple[nn.Module, AutoTokenizer, float, Dict[int, float]]:
     logger.info("=" * 60)
     logger.info("  IMPROVED Weight Blending (interpolated layers + alpha search)")
@@ -412,15 +411,6 @@ def streamed_merge_improved(
 
     if skipped:
         logger.info("  Skipped %d incompatible weights", len(skipped))
-
-    if use_procrustes and ha and hb:
-        logger.info("  Applying orthogonal Procrustes alignment...")
-        try:
-            b_proj = merge_prod._apply_procrustes_alignment(
-                model_a, model_b, mapping, b_proj, ha, hb
-            )
-        except Exception as e:
-            logger.info("  Procrustes skipped: %s", e)
 
     logger.info("  Optimizing per-layer alphas...")
     best_alpha_val = 0.5
@@ -784,7 +774,7 @@ def streamed_merge_diff_arch(
         os.makedirs(save_dir, exist_ok=True)
         torch.save(bridge.state_dict(), os.path.join(save_dir, "bridge.pt"))
         tokenizer.save_pretrained(save_dir)
-        with open(os.path.join(save_dir, "bridge_config.json"), "w") as f:
+        with open(os.path.join(save_dir, "merge_config.json"), "w") as f:
             json.dump({
                 "d_a": utils.hidden_dim(model_a.config),
                 "d_b": utils.hidden_dim(model_b.config),

@@ -37,6 +37,7 @@ __all__ = [
     "train_bridge_cached",
     "merge_diff_arch",
     "merge_diff_arch_streamed",
+    "merge_diff_arch_standalone",
     "generate_bridge",
     "stitch_generate",
     "verify_generations",
@@ -255,39 +256,6 @@ def activation_similarity(h_a: torch.Tensor, h_b: torch.Tensor) -> torch.Tensor:
     hb_2d = h_b.reshape(-1, h_b.shape[-1])
     min_n = min(ha_2d.shape[0], hb_2d.shape[0])
     return hsic_cka(ha_2d[:min_n], hb_2d[:min_n])
-
-
-def _compute_procrustes_rotation(
-    model_a: nn.Module,
-    model_b: nn.Module,
-    mapping: Dict[int, int],
-    ha: Dict[int, torch.Tensor],
-    hb: Dict[int, torch.Tensor],
-) -> Optional[torch.Tensor]:
-    """Compute orthogonal rotation R aligning B's space to A's."""
-    last_a = max(ha.keys()) if ha else None
-    last_b = max(hb.keys()) if hb else None
-    if last_a is None or last_b is None:
-        return None
-
-    h_a_t = ha[last_a].float().reshape(-1, ha[last_a].shape[-1])
-    h_b_t = hb[last_b].float().reshape(-1, hb[last_b].shape[-1])
-
-    d_h = h_a_t.shape[1]
-    if h_b_t.shape[1] != d_h:
-        return None
-
-    C = h_b_t.T @ h_a_t
-    trace_C = torch.trace(C).abs().item()
-    lambda_reg = max(1e-4 * trace_C / d_h, 1e-6)
-    C_reg = C + lambda_reg * torch.eye(d_h, device=C.device)
-
-    U, _, Vt = torch.linalg.svd(C_reg, full_matrices=False)
-    R = U @ Vt
-    if torch.det(R) < 0:
-        Vt[-1] *= -1
-        R = U @ Vt
-    return R
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -674,7 +642,6 @@ def merge_same_arch(
     model_b: nn.Module,
     calib_texts: Optional[List[str]] = None,
     save_name: Optional[str] = None,
-    use_procrustes: bool = False,
 ) -> Tuple[nn.Module, AutoTokenizer]:
     """Merge two same-architecture models via CKA-guided weight blending.
     
@@ -686,7 +653,6 @@ def merge_same_arch(
         model_b: Second model (will be projected to A's dimensions)
         calib_texts: Calibration texts for similarity computation
         save_name: If set, save merged model to this directory
-        use_procrustes: Apply orthogonal Procrustes alignment
     
     Returns:
         Tuple of (merged_model, tokenizer)
@@ -740,17 +706,12 @@ def merge_same_arch(
     avg_sim = float(np.mean(list(sim_vals.values())))
     logger.info("Avg layer similarity: %.3f", avg_sim)
 
-    if use_procrustes:
-        logger.info("Applying Procrustes alignment...")
-    else:
-        logger.info("Projecting B weights to A dimensions...")
+    logger.info("Projecting B weights to A dimensions...")
 
     prefix_a = _get_layer_prefix(model_a)
     prefix_b = _get_layer_prefix(model_b)
 
     b_proj = _project_b_weights(model_a, model_b, mapping, prefix_a, prefix_b)
-    if use_procrustes:
-        b_proj = _apply_procrustes_alignment(model_a, model_b, mapping, b_proj, ha, hb)
 
     alphas: Dict[int, float] = {}
     for i in range(n_a):
@@ -801,12 +762,14 @@ def merge_same_arch(
         os.makedirs(save_dir, exist_ok=True)
         merged.save_pretrained(save_dir)
         tok.save_pretrained(save_dir)
-        with open(os.path.join(save_dir, "merge_info.json"), "w") as f:
+        with open(os.path.join(save_dir, "merge_config.json"), "w") as f:
             json.dump({
+                "type": "same_arch_blend",
+                "model_a": model_a.config._name_or_path if hasattr(model_a.config, "_name_or_path") else "unknown",
+                "model_b": model_b.config._name_or_path if hasattr(model_b.config, "_name_or_path") else "unknown",
                 "alphas": {str(k): round(v, 3) for k, v in best_alphas.items()},
                 "final_ppl": round(final_ppl, 1),
                 "avg_similarity": round(avg_sim, 3),
-                "type": "same_arch_different_size",
             }, f, indent=2)
         logger.info("Saved merged model to %s", save_dir)
 
@@ -908,45 +871,6 @@ def _is_embed_or_output_key(key: str) -> bool:
     return bool(parts & _EMBED_OUTPUT_TOKENS)
 
 
-def _apply_procrustes_alignment(
-    model_a: nn.Module,
-    model_b: nn.Module,
-    mapping: Dict[int, int],
-    b_proj: Dict[Union[Tuple[int, str], str], torch.Tensor],
-    ha: Dict[int, torch.Tensor],
-    hb: Dict[int, torch.Tensor],
-) -> Dict[Union[Tuple[int, str], str], torch.Tensor]:
-    """Align B's weights to A's coordinate system via orthogonal Procrustes."""
-    d_h = utils.hidden_dim(model_a.config)
-    R = _compute_procrustes_rotation(model_a, model_b, mapping, ha, hb)
-    if R is None:
-        logger.warning("Procrustes rotation failed, using unaligned projections")
-        return b_proj
-
-    aligned: Dict[Union[Tuple[int, str], str], torch.Tensor] = {}
-    for key, w in b_proj.items():
-        if isinstance(key, tuple):
-            w_f = w.float()
-            if w_f.dim() == 2:
-                d0, d1 = w_f.shape
-                R_dev = R.to(w_f.device, dtype=torch.float32)
-                if d0 == d_h and d1 == d_h:
-                    aligned[key] = (R_dev @ w_f @ R_dev.T).to(w.dtype)
-                elif d1 == d_h:
-                    aligned[key] = (w_f @ R_dev.T).to(w.dtype)
-                elif d0 == d_h:
-                    aligned[key] = (R_dev @ w_f).to(w.dtype)
-                else:
-                    aligned[key] = w
-            else:
-                aligned[key] = w
-        else:
-            aligned[key] = w
-
-    logger.info("Applied Procrustes alignment")
-    return aligned
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # SAME-ARCH BRIDGE
 # ═══════════════════════════════════════════════════════════════════════════
@@ -993,9 +917,11 @@ def merge_same_arch_bridge(
         os.makedirs(save_dir, exist_ok=True)
         torch.save(bridge.state_dict(), os.path.join(save_dir, "bridge.pt"))
         tok.save_pretrained(save_dir)
-        with open(os.path.join(save_dir, "bridge_config.json"), "w") as f:
+        with open(os.path.join(save_dir, "merge_config.json"), "w") as f:
             json.dump({
                 "type": "same_arch_bridge",
+                "model_a": model_a.config._name_or_path if hasattr(model_a.config, "_name_or_path") else "unknown",
+                "model_b": model_b.config._name_or_path if hasattr(model_b.config, "_name_or_path") else "unknown",
                 "d_a": utils.hidden_dim(model_a.config),
                 "d_b": utils.hidden_dim(model_b.config),
                 "n_layers_a": n_a,
@@ -1115,11 +1041,14 @@ def merge_diff_arch(
     weight_decay: float = 0.01,
     max_len: int = 128,
     bridge_type: str = "linear",
+    streamed: bool = False,
+    device: str = "cuda",
 ) -> nn.Module:
     """Merge models of different architectures via a trained bridge.
     
     Uses a zero-initialized linear/MLP projection to map B's hidden states
     into A's representation space, trained via next-token prediction.
+    When streamed=True, processes one layer at a time for low-VRAM.
     
     Args:
         model_a: Target model (controls output)
@@ -1133,10 +1062,30 @@ def merge_diff_arch(
         weight_decay: Weight decay
         max_len: Maximum sequence length
         bridge_type: "linear" or "mlp"
+        streamed: Use streaming mode for low VRAM
+        device: Device for streaming mode
     
     Returns:
         Trained bridge module
     """
+    if streamed:
+        try:
+            from .merge_stream import streamed_merge_diff_arch
+            logger.info("Using streamed merge (low VRAM mode)...")
+            return streamed_merge_diff_arch(
+                model_a, model_b,
+                calib_texts=calib_texts,
+                save_name=save_name,
+                device=device,
+                tok=tok,
+                steps=steps,
+                lr=lr,
+                weight_decay=weight_decay,
+                max_len=max_len,
+                bridge_type=bridge_type,
+            )
+        except ImportError:
+            logger.warning("Streaming not available, falling back to standard mode")
     if tok is None:
         tok = AutoTokenizer.from_pretrained(
             model_a.config._name_or_path if hasattr(model_a.config, "_name_or_path") else "distilgpt2"
@@ -1190,15 +1139,15 @@ def merge_diff_arch(
     os.makedirs(bridge_dir, exist_ok=True)
     torch.save(bridge.state_dict(), os.path.join(bridge_dir, "bridge.pt"))
     tok.save_pretrained(bridge_dir)
-    with open(os.path.join(bridge_dir, "bridge_config.json"), "w") as f:
+    with open(os.path.join(bridge_dir, "merge_config.json"), "w") as f:
         json.dump({
-            "d_a": utils.hidden_dim(model_a.config),
-            "d_b": utils.hidden_dim(model_b.config),
+            "type": "diff_arch_bridge",
             "model_a": model_a.config._name_or_path if hasattr(model_a.config, "_name_or_path") else "unknown",
             "model_b": model_b.config._name_or_path if hasattr(model_b.config, "_name_or_path") else "unknown",
+            "d_a": utils.hidden_dim(model_a.config),
+            "d_b": utils.hidden_dim(model_b.config),
             "ppl_a": round(pp_a, 1),
             "ppl_bridge": round(b_ppl, 1) if 'b_ppl' in dir() else None,
-            "type": "diff_arch_bridge",
             "steps": steps,
             "lr": lr,
             "bridge_type": bridge_type,
@@ -1224,39 +1173,244 @@ def merge_diff_arch_streamed(
 ) -> nn.Module:
     """Cross-architecture merge using streaming for memory efficiency.
     
-    Same as merge_diff_arch but designed for low-VRAM environments.
-    Processes one layer at a time.
+    Deprecated: use merge_diff_arch(streamed=True) instead.
     """
-    try:
-        from . import merge_stream
-        logger.info("Using streamed merge (low VRAM mode)...")
-        bridge = merge_stream.streamed_merge_diff_arch(
-            model_a, model_b,
-            calib_texts=calib_texts,
-            save_name=save_name,
-            device=device,
-            tok=tok,
-            steps=steps,
-            lr=lr,
-            weight_decay=weight_decay,
-            max_len=max_len,
-            bridge_type=bridge_type,
+    logger.warning("merge_diff_arch_streamed is deprecated, use merge_diff_arch(streamed=True)")
+    return merge_diff_arch(
+        model_a, model_b,
+        calib_texts=calib_texts,
+        token_map=token_map,
+        save_name=save_name,
+        tok=tok,
+        steps=steps, lr=lr,
+        weight_decay=weight_decay,
+        max_len=max_len,
+        bridge_type=bridge_type,
+        streamed=True,
+        device=device,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CROSS-ARCHITECTURE STANDALONE MERGE (No Bridge Required at Runtime)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def merge_diff_arch_standalone(
+    model_a: nn.Module,
+    model_b: nn.Module,
+    calib_texts: Optional[List[str]] = None,
+    token_map: Optional[Dict[int, int]] = None,
+    save_name: str = "merged_standalone",
+    tok: Optional[AutoTokenizer] = None,
+    bridge_steps: int = 10,
+    distill_steps: int = 30,
+    lr: float = 3e-4,
+    max_len: int = 64,
+    bridge_type: str = "linear",
+    blend_alpha: float = 0.5,
+    kl_weight: float = 5.0,
+    verbose: bool = True,
+) -> nn.Module:
+    """Cross-architecture merge producing a standalone from_pretrained-compatible model.
+    
+    Three-stage process:
+    1. Train a bridge (maps B's hidden states into A's space)
+    2. Project B's weights to A's dimensions via SVD and blend with A
+    3. Distill bridge outputs into the blended model via KL+CE
+    Result: a standalone model in A's architecture that captures knowledge from B.
+    
+    Args:
+        model_a: Target model (controls architecture of output)
+        model_b: Source model (knowledge to transfer)
+        calib_texts: Calibration texts
+        token_map: Token ID mapping for cross-tokenizer scenarios
+        save_name: Directory name for saving
+        tok: Tokenizer (defaults to model_a's tokenizer)
+        bridge_steps: Number of bridge training steps
+        distill_steps: Number of distillation steps
+        lr: Learning rate
+        max_len: Maximum sequence length
+        bridge_type: "linear" or "mlp"
+        blend_alpha: Weight for model A in initial blend (0.5 = equal)
+        kl_weight: Weight for KL divergence in distillation loss
+    
+    Returns:
+        Standalone merged model (from_pretrained-compatible) in A's architecture
+    """
+    if tok is None:
+        tok = AutoTokenizer.from_pretrained(
+            model_a.config._name_or_path if hasattr(model_a.config, "_name_or_path") else "distilgpt2"
         )
-        return bridge
-    except ImportError:
-        logger.warning("merge_stream not available, falling back to standard merge_diff_arch")
-        return merge_diff_arch(
-            model_a, model_b,
-            calib_texts=calib_texts,
-            token_map=token_map,
-            save_name=save_name,
-            tok=tok,
-            steps=steps,
-            lr=lr,
-            weight_decay=weight_decay,
-            max_len=max_len,
-            bridge_type=bridge_type,
+        tok.pad_token = tok.eos_token
+
+    if calib_texts is None:
+        calib_texts = load_texts(48)
+
+    device = next(model_a.parameters()).device
+    d_a = utils.hidden_dim(model_a.config)
+    d_b = utils.hidden_dim(model_b.config)
+    logger.info("Standalone merge: A(%s d=%d) + B(%s d=%d)",
+                 type(model_a).__name__, d_a, type(model_b).__name__, d_b)
+
+    # Step 1: Train bridge
+    logger.info("Stage 1/3: Training bridge (%d steps)...", bridge_steps)
+    bridge = train_bridge_cached(
+        model_a, model_b, tok, calib_texts,
+        steps=bridge_steps, lr=lr, max_len=max_len, verbose=True,
+        token_map=token_map, bridge_type=bridge_type,
+    )
+
+    # Step 2: Project B weights to A dims and blend
+    logger.info("Stage 2/3: Projecting B weights & blending (alpha=%.2f)...", blend_alpha)
+    n_a = utils.num_layers(model_a.config)
+    n_b = utils.num_layers(model_b.config)
+    prefix_a = _get_layer_prefix(model_a)
+    prefix_b = _get_layer_prefix(model_b)
+    sd_a = model_a.state_dict()
+    sd_b = model_b.state_dict()
+    mapping = utils.proportional_map(n_a, n_b)
+
+    b_proj = {}
+    layers_a = {}
+    for k, v in sd_a.items():
+        if k.startswith(prefix_a):
+            parts = k[len(prefix_a):].split(".")
+            idx, local = int(parts[0]), ".".join(parts[1:])
+            layers_a.setdefault(idx, {})[local] = v
+
+    for i_a, i_b in mapping.items():
+        for local, w_a in layers_a.get(i_a, {}).items():
+            bk = f"{prefix_b}{i_b}.{local}"
+            if bk in sd_b:
+                w_b = sd_b[bk].float()
+                if w_a.shape == w_b.shape:
+                    b_proj[(i_a, local)] = w_b
+                elif w_a.dim() == 2:
+                    b_proj[(i_a, local)] = utils.svd_project(w_b, *w_a.shape)
+                elif w_a.dim() == 1:
+                    b_proj[(i_a, local)] = F.interpolate(
+                        w_b.view(1, 1, -1), size=w_a.shape[0], mode="linear"
+                    ).view(-1)
+
+    for k in sd_a:
+        if not k.startswith(prefix_a) and k in sd_b:
+            if sd_a[k].shape == sd_b[k].shape:
+                b_proj[k] = sd_b[k].float()
+
+    alphas = {i: blend_alpha for i in range(n_a)}
+    merged_sd = {}
+    for k, v in sd_a.items():
+        merged_sd[k] = v.clone()
+        if k.startswith(prefix_a):
+            rest = k[len(prefix_a):]
+            parts = rest.split(".")
+            i_a = int(parts[0])
+            if i_a in mapping:
+                a = alphas.get(i_a, blend_alpha)
+                local = ".".join(parts[1:])
+                key = (i_a, local)
+                if key in b_proj:
+                    merged_sd[k] = (a * v.float() + (1 - a) * b_proj[key]).to(v.dtype)
+
+    blended = AutoModelForCausalLM.from_config(model_a.config)
+    blended.load_state_dict(merged_sd, strict=False)
+    blended.to(device)
+    blended.eval()
+
+    # Compute pre-distill PPL
+    enc = tok(calib_texts[:4], truncation=True, padding=True, max_length=max_len, return_tensors="pt")
+    ids = enc.input_ids.to(device)
+    mask = enc.attention_mask.to(device)
+    pre_ppl = ppl(blended, ids, mask)
+    logger.info("Blended (pre-distill) PPL: %.1f", pre_ppl)
+
+    # Step 3: Distill bridge outputs into blended model
+    logger.info("Stage 3/3: Distilling bridge into blend (%d steps)...", distill_steps)
+    lm_head = _get_lm_head(model_a)
+    enc_full = tok(calib_texts, truncation=True, padding=True, max_length=max_len, return_tensors="pt")
+    ids_full = enc_full.input_ids.to(device)
+
+    with torch.no_grad():
+        ids_b = ids_full
+        if token_map:
+            ids_b = torch.tensor(
+                [[token_map.get(i.item(), 0) for i in row] for row in ids_full],
+                device=device,
+            )
+        oa = model_a(ids_full, output_hidden_states=True)
+        ob = model_b(ids_b, output_hidden_states=True)
+        ha = oa.hidden_states[-1].float()
+        hb = ob.hidden_states[-1].float()
+        k_min = min(ha.shape[1], hb.shape[1])
+        hf = bridge(ha[:, :k_min], hb[:, :k_min])
+        dtype = next(model_a.parameters()).dtype
+        bridge_logits = lm_head(hf.to(dtype)).detach()
+        bridge_probs = F.softmax(bridge_logits / 2.0, dim=-1).detach()
+
+    opt = torch.optim.AdamW(blended.parameters(), lr=lr * 0.1, weight_decay=0.01)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=distill_steps)
+    best_loss = float("inf")
+    best_sd = None
+    blended.train()
+    torch.set_grad_enabled(True)
+    for s in range(distill_steps):
+        opt.zero_grad()
+        out = blended(ids_full, output_hidden_states=True)
+        blended_logits = out.logits
+        k2 = min(blended_logits.shape[1], bridge_probs.shape[1])
+
+        blended_log_sm = F.log_softmax(blended_logits[:, :k2] / 2.0, dim=-1)
+        kl_loss = F.kl_div(
+            blended_log_sm.reshape(-1, blended_log_sm.size(-1)),
+            bridge_probs[:, :k2].reshape(-1, bridge_probs.size(-1)),
+            reduction="batchmean",
         )
+        ce_loss = F.cross_entropy(
+            blended_logits[:, :k2][..., :-1, :].reshape(-1, blended_logits.size(-1)),
+            ids_full[:, :k2][..., 1:].reshape(-1),
+            ignore_index=-100,
+        )
+        loss = kl_loss * kl_weight + ce_loss
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(blended.parameters(), 1.0)
+        opt.step()
+        sched.step()
+
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            best_sd = copy.deepcopy(blended.state_dict())
+
+        if verbose and (s + 1) % 10 == 0:
+            logger.info("  Distill step %d/%d: KL=%.4f CE=%.4f", s + 1, distill_steps, kl_loss.item(), ce_loss.item())
+
+    if best_sd:
+        blended.load_state_dict(best_sd)
+    blended.eval()
+    torch.set_grad_enabled(False)
+
+    final_ppl = ppl(blended, ids, mask)
+    logger.info("Standalone merge final PPL: %.1f (parent A: %.1f)", final_ppl, ppl(model_a, ids, mask))
+
+    # Save
+    bridge_dir = os.path.join(SAVE_DIR, save_name)
+    os.makedirs(bridge_dir, exist_ok=True)
+    blended.save_pretrained(bridge_dir)
+    tok.save_pretrained(bridge_dir)
+    with open(os.path.join(bridge_dir, "merge_config.json"), "w") as f:
+        json.dump({
+            "type": "standalone_diff_arch",
+            "model_a": model_a.config._name_or_path if hasattr(model_a.config, "_name_or_path") else "unknown",
+            "model_b": model_b.config._name_or_path if hasattr(model_b.config, "_name_or_path") else "unknown",
+            "d_a": d_a,
+            "d_b": d_b,
+            "bridge_steps": bridge_steps,
+            "distill_steps": distill_steps,
+            "final_ppl": round(final_ppl, 1),
+            "pre_distill_ppl": round(pre_ppl, 1),
+        }, f, indent=2)
+    logger.info("Saved standalone merged model to %s", bridge_dir)
+    clean()
+    return blended
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1288,7 +1442,7 @@ def load_merged(
     """Load a saved bridge and tokenizer.
     
     Args:
-        bridge_dir: Directory containing bridge.pt and bridge_config.json
+        bridge_dir: Directory containing bridge.pt and merge_config.json
         model_a: Target model A
         model_b: Source model B
         tok: Optional tokenizer (loaded from bridge_dir if not provided)
@@ -1298,7 +1452,7 @@ def load_merged(
     """
     d_a = utils.hidden_dim(model_a.config)
     d_b = utils.hidden_dim(model_b.config)
-    config_path = os.path.join(bridge_dir, "bridge_config.json")
+    config_path = os.path.join(bridge_dir, "merge_config.json")
     bridge_type = "linear"
     if os.path.exists(config_path):
         with open(config_path) as f:

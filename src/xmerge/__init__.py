@@ -1,34 +1,9 @@
-"""xmerge: Merge LLMs of different architectures and sizes WITHOUT full training.
+"""xmerge: Merge LLMs across architectures and sizes leveraging representation-level merging.
 
-Canonical API:
-  merge_same_arch       — CKA-guided weight blending for same-architecture models
-  train_bridge_v2       — Zero-init bridge + cosine-LR fine-tune (with backprop)
-  train_bridge_cached   — 100x faster bridge training using cached hidden states
-  merge_diff_arch       — Full cross-architecture bridge pipeline
-  merge_diff_arch_streamed — Low-VRAM streaming cross-architecture merge
+Includes weight blending for same-architecture models, zero-init bridge networks for
+cross-architecture, and standalone merged models via weight translation + distillation.
 
-Generation:
-  stitch_generate       — Generate through a trained bridge
-  generate_bridge       — Generate with controllable blending (mix_alpha)
-
-Evaluation:
-  load_merged           — Load a saved bridge
-  verify_generations    — Print sample outputs
-
-Utilities:
-  OptimalBridge, MLPBridge — Bridge network modules
-  activation_similarity    — CKA similarity between hidden states
-  load_texts               — Load WikiText-2 calibration data
-
-Streaming (low VRAM):
-  merge_stream.streamed_train_bridge_cached — 7B models on 4GB VRAM
-  merge_stream.StreamedGenerator            — Streamed generation
-
-CLI:
-  xmerge merge --config config.json   — Run a merge from config
-  xmerge eval --bridge-dir path       — Evaluate a saved bridge
-  xmerge list                         — List saved merges
-  xmerge clean                        — Clear GPU memory
+CLI: xmerge merge --config config.json | eval | list | clean
 """
 
 import logging
@@ -47,6 +22,7 @@ from .merge_prod import (
     load_merged,
     load_texts,
     merge_diff_arch,
+    merge_diff_arch_standalone,
     merge_diff_arch_streamed,
     merge_same_arch,
     merge_same_arch_bridge,
@@ -75,6 +51,7 @@ __all__ = [
     "train_bridge_cached",
     "merge_diff_arch",
     "merge_diff_arch_streamed",
+    "merge_diff_arch_standalone",
     # Generation
     "stitch_generate",
     "generate_bridge",
